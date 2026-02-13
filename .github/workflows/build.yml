@@ -1,0 +1,173 @@
+name: Build
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+    paths-ignore:
+      - 'LICENSE'
+      - '**.md'
+  pull_request:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      test_release:
+        description: 'Test release?'
+        required: true
+        default: 'false'
+      rebuild_sysroot:
+        description: 'Force rebuild sysroot?'
+        required: true
+        default: 'false'
+env:
+  BUILD_XCODE_PATH: /Applications/Xcode_26.0.app
+  RUNNER_IMAGE: macos-15
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: 60
+jobs:
+  configuration:
+    name: Setup configuration
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.checker.outputs.runners }}
+      github-runner: ${{ steps.checker.outputs.github-runner }}
+    steps:
+    - name: Check for hosted runners
+      id: checker
+      shell: bash
+      env:
+        IS_SELF_HOSTED_RUNNER: ${{ vars.IS_SELF_HOSTED_RUNNER || (github.repository_owner == 'utmapp' && 'true') }}
+      run: |
+        echo "github-runner='$RUNNER_IMAGE'" >> $GITHUB_OUTPUT
+        if [ "$IS_SELF_HOSTED_RUNNER" == "true" ]; then
+          echo "runners=['self-hosted', 'macOS']" >> $GITHUB_OUTPUT
+        else
+          echo "runners='$RUNNER_IMAGE'" >> $GITHUB_OUTPUT
+        fi
+  build-sysroot:
+    name: Build Sysroot
+    runs-on: ${{ fromJSON(needs.configuration.outputs.runner) }}
+    needs: configuration
+    strategy:
+      matrix:
+        arch: [arm64]
+        platform: [ios]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Setup Xcode
+        shell: bash
+        run: |
+          [[ "$(xcode-select -p)" == "${{ env.BUILD_XCODE_PATH }}"* ]] || sudo xcode-select -s "${{ env.BUILD_XCODE_PATH }}"
+      - name: Check Cache
+        id: cache-sysroot
+        uses: actions/cache/restore@v4
+        with:
+          path: ./sysroot-${{ matrix.platform }}-${{ matrix.arch }}
+          key: ${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}-${{ github.sha }}
+          restore-keys: ${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}
+          lookup-only: github.event_name != 'release' && github.event.inputs.test_release != 'true'
+      - name: Setup Path
+        shell: bash
+        run: |
+          echo "/usr/local/opt/bison/bin:/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
+      - name: Install Requirements
+        if: (steps.cache-sysroot.outputs.cache-matched-key == '' || github.event.inputs.rebuild_sysroot == 'true') && needs.configuration.outputs.runner == env.RUNNER_IMAGE
+        run: |
+          brew uninstall cmake
+          brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake
+          pip3 install --break-system-packages --user six pyparsing pyyaml setuptools distlib mako
+          gem install --user-install xcpretty
+          rm -f /usr/local/lib/pkgconfig/*.pc
+      - name: Build Sysroot
+        if: steps.cache-sysroot.outputs.cache-matched-key == '' || github.event.inputs.rebuild_sysroot == 'true'
+        run: ./scripts/build_dependencies.sh -p ${{ matrix.platform }} -a ${{ matrix.arch }}
+        env:
+          NCPU: ${{ endsWith(matrix.platform, '-tci') && '1' || '0' }}
+      - name: Compress Sysroot
+        if: steps.cache-sysroot.outputs.cache-matched-key == '' || github.event_name == 'release' || github.event.inputs.test_release == 'true' || github.event.inputs.rebuild_sysroot == 'true'
+        run: tar -acf sysroot.tgz sysroot*
+      - name: Upload Sysroot
+        if: steps.cache-sysroot.outputs.cache-matched-key == '' || github.event_name == 'release' || github.event.inputs.test_release == 'true' || github.event.inputs.rebuild_sysroot == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sysroot-${{ matrix.platform }}-${{ matrix.arch }}
+          path: sysroot.tgz
+      - name: Save Cache
+        if: steps.cache-sysroot.outputs.cache-matched-key == ''
+        uses: actions/cache/save@v4
+        with:
+          path: ./sysroot-${{ matrix.platform }}-${{ matrix.arch }}
+          key: ${{ steps.cache-sysroot.outputs.cache-primary-key }}
+          upload-chunk-size: 1048576
+  build-utm:
+    name: Build UTM
+    runs-on: ${{ fromJSON(needs.configuration.outputs.runner) }}
+    needs: [configuration, build-sysroot]
+    strategy:
+      matrix:
+        configuration: [
+          {arch: "arm64", sdk: "iphoneos", platform: "ios", scheme: "iOS"}
+        ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+      - name: Cache Sysroot
+        id: cache-sysroot
+        uses: actions/cache/restore@v4
+        with:
+          path: ./sysroot-${{ matrix.configuration.platform }}-${{ matrix.configuration.arch }}
+          key: ${{ matrix.configuration.platform }}-${{ matrix.configuration.arch }}-${{ hashFiles('scripts/build_dependencies.sh') }}-${{ hashFiles('patches/**') }}
+          fail-on-cache-miss: true
+      - name: Setup Xcode
+        shell: bash
+        run: |
+          [[ "$(xcode-select -p)" == "${{ env.BUILD_XCODE_PATH }}"* ]] || sudo xcode-select -s "${{ env.BUILD_XCODE_PATH }}"
+      - name: Build UTM
+        run: |
+          ./scripts/build_utm.sh -k ${{ matrix.configuration.sdk }} -s ${{ matrix.configuration.scheme }} -a ${{ matrix.configuration.arch }} -o UTM
+          tar -acf UTM.xcarchive.tgz UTM.xcarchive
+      - name: Upload UTM
+        uses: actions/upload-artifact@v4
+        with:
+          name: UTM-${{ matrix.configuration.scheme }}-${{ matrix.configuration.platform }}-${{ matrix.configuration.arch }}
+          path: UTM.xcarchive.tgz
+  package-ios-hv:
+    name: Package (iOS-HV)
+    runs-on: ${{ fromJSON(needs.configuration.outputs.github-runner) }}
+    needs: [configuration, build-utm]
+    if: github.event_name == 'release' || github.event.inputs.test_release == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: UTM-iOS-ios-arm64
+      - name: Install ldid + dpkg
+        run: brew install ldid dpkg
+      - name: Fakesign HV IPA
+        run: |
+          tar -xf UTM.xcarchive.tgz
+          ./scripts/package.sh ipa-hv UTM.xcarchive .
+      - name: Upload HV IPA Artifact
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: UTM-HV.ipa
+          path: UTM.ipa
+      - name: Upload HV IPA to Release
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: UTM.ipa
+          asset_name: UTM-HV.ipa
+          asset_content_type: application/octet-stream
