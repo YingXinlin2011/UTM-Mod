@@ -1,0 +1,25 @@
+name: Build IPA
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip
+        run: unzip UTM-main.zip
+      - name: Build
+        run: |
+          cd UTM-main
+          xcodebuild -scheme UTM -destination generic/platform=iOS build CODE_SIGNING_ALLOWED=NO
+      - name: Make IPA
+        run: 
+          cd UTM-main/build/Release-iphoneos
+          mkdir Payload
+          mv UTM.app Payload
+          zip -r UTM.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UTM.ipa
+          path: UTM-main/build/Release-iphoneos/UTM.ipa
